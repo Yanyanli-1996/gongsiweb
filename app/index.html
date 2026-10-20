@@ -1,0 +1,1278 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>材质特性文案库</title>
+<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="panel.css">
+<link rel="stylesheet" href="history.css">
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>材质特性文案库</h1>
+    <div class="sub">按「品类 → 材质 → 特性标签 → 文案包装」四层筛选，找到即用。</div>
+    <div class="ai-bar">
+      <button id="aiTrigger">AI 识别入库</button>
+      <button id="aiMatchTrigger">AI 识别材质特性</button>
+    </div>
+    <div class="searchbar">
+      <input type="search" id="q" placeholder="搜索材质、特性、文案关键词…  如：乳胶 / Q弹 / 透气 / 显小">
+    </div>
+  </header>
+
+  <div id="syncStatus" class="sync-status" role="status" aria-live="polite"></div>
+  <div class="layout">
+    <aside class="side" id="filters"></aside>
+    <div class="main">
+      <div class="toolbar">
+        <div class="count" id="count"></div>
+        <div class="spacer"></div>
+        <button class="btn" id="pickBtn">批量操作</button>
+        <button class="btn" id="reset">清空筛选</button>
+        <div class="menu-wrap">
+          <button class="btn" id="expBtn">导出备份</button>
+          <div class="menu" id="expMenu">
+            <button data-exp="csv">导出 CSV（Excel 可打开）</button>
+            <button data-exp="json">导出 JSON（完整备份，可还原）</button>
+          </div>
+        </div>
+      </div>
+      <div class="batchbar" id="batchbar"></div>
+      <div class="grid" id="grid"></div>
+      <div id="empty"></div>
+      <div class="stats" id="stats"></div>
+    </div>
+  </div>
+</div>
+
+<script src="tags-data.js"></script>
+<script src="materials-data.js"></script>
+<script src="cloud-config.js"></script>
+<script src="doc-parse.js"></script>
+<script src="mat-profile.js"></script>
+<script src="kb-cat.js"></script>
+<script src="kb-matcat.js"></script>
+<script src="material-profile.js"></script>
+<script src="ingest.js"></script>
+<script src="panel.js"></script>
+<script>
+(function(){
+  /* 状态：品类 → 材质 → 标签（多维度）→ 关键词 */
+  var state = {
+    q:'', group:null, material:null,
+    tag:{}, openDims:{}, source:'all', userNotes:[],
+    saving:{},
+    editing:{},          // 正在编辑的卡片 id 集合，可多张同时编辑
+    draft:{},            // 编辑草稿：{ cardId: {...} }
+    selected:{},         // 批量操作选中的卡片 id
+    picking:false        // 批量选择模式
+  };
+
+  var TREE = (window.KB_TAGS && window.KB_TAGS.tree) || {};
+  var GROUP_TAGS = (window.KB_TAGS && window.KB_TAGS.groupTags) || {};
+  var GROUP_MATS = (window.KB_TAGS && window.KB_TAGS.groupMaterials) || {};
+  var MAT_PARENT = (window.KB_TAGS && window.KB_TAGS.materialParents) || {};
+  var GROUP_ORDER = (window.KB_TAGS && window.KB_TAGS.groupOrder) || [];
+
+  /* 品类全集 = 标签体系里的固定清单 + 入库数据里实际出现的品类
+     （数据里可能有清单外的新品类，如「儿童学习桌」「椅子配件」） */
+  function allGroups(){
+    var set = {};
+    GROUP_ORDER.forEach(function(g){ set[g] = 1; });
+    allEntries().forEach(function(e){
+      (e.appliesTo && e.appliesTo.length ? e.appliesTo : [e.group]).forEach(function(g){
+        if(g) set[g] = 1;
+      });
+    });
+    return Object.keys(set);
+  }
+
+  /* 标签索引：'分类/维度/值' → true */
+  var TAG_VALUES = {};
+  Object.keys(TREE).forEach(function(cat){
+    Object.keys(TREE[cat]).forEach(function(dim){
+      TREE[cat][dim].values.forEach(function(v){ TAG_VALUES[cat+'/'+dim+'/'+v] = true; });
+    });
+  });
+  var ALL_TAG_VALUES = Object.keys(TAG_VALUES).map(function(k){
+    return k.slice(k.lastIndexOf('/') + 1);
+  });
+  function allTagValues(){ return ALL_TAG_VALUES; }
+
+  function esc(s){
+    return String(s==null?'':s).replace(/[&<>"']/g,function(c){
+      return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+    });
+  }
+
+  function allEntries(){ return (state.userNotes||[]).concat(window.KB_MATERIALS_CARDS || []); }
+
+  /* 归一为数组：兼容数据库里「数组」与「字符串」两种存法 */
+  function asArr(v){
+    if(v == null) return [];
+    if(Array.isArray(v)) return v;
+    return String(v).split(/[、,，]/).map(function(s){ return s.trim(); }).filter(Boolean);
+  }
+
+  /* 一张卡片的所有材质（材质可能有多个） */
+  function matsOf(e){
+    var ms = e.materials && e.materials.length ? asArr(e.materials) : [];
+    if(!ms.length && e.material) ms = asArr(e.material);
+    return ms;
+  }
+
+  /* 一张卡片的所有标签（数据库里是扁平数组） */
+  function flatTags(e){
+    return asArr(e.tags);
+  }
+
+  /* 还原三行句子里的可点关键词 */
+  function fillKw(lines, tags){
+    var out = {
+      scene: lines.scene || '', pain: lines.pain || '', sell: lines.sell || ''
+    };
+    out.sceneKw = kwIn(out.scene, tags);
+    out.painKw  = kwIn(out.pain,  tags);
+    out.sellKw  = kwIn(out.sell,  tags);
+    return out;
+  }
+
+  /* 材质包含关系：子材质命中父材质也算 */
+  function matMatch(mat, target){
+    if(mat === target) return true;
+    var parents = MAT_PARENT[mat] || [];
+    return parents.indexOf(target) > -1;
+  }
+
+  /* 一张卡可对应多个品类（appliesTo），任一命中即算该品类 */
+  function inGroup(e){
+    if(!state.group) return true;
+    if(e.appliesTo && e.appliesTo.length) return e.appliesTo.indexOf(state.group) > -1;
+    return e.group === state.group;
+  }
+  function inMat(e){
+    if(!state.material) return true;
+    return matMatch(e.material, state.material);
+  }
+  function hasTag(e){
+    var sel = [];
+    Object.keys(state.tag).forEach(function(k){ state.tag[k].forEach(function(v){ sel.push(v); }); });
+    if(!sel.length) return true;
+    var mine = e.tags || [];
+    for(var i=0;i<sel.length;i++) if(mine.indexOf(sel[i]) > -1) return true;
+    return false;
+  }
+
+  /* ---------- 筛选 ---------- */
+  function matches(e){
+    if(state.source === 'user' && !e.isUser) return false;
+    if(state.source === 'builtin' && e.isUser) return false;
+    if(!inGroup(e) || !inMat(e)) return false;
+    if(!hasTag(e)) return false;
+    if(state.q.trim()){
+      // 关键词搜索：材质、品类、关键词、标签、文案全部参与
+      var hay = [e.material, e.group, (e.keywords||[]).join(' '),
+                 (e.tags||[]).join(' '), (e.copy||[]).map(function(c){return c.text;}).join(' ')]
+                .join(' ').toLowerCase();
+      if(hay.indexOf(state.q.trim().toLowerCase()) === -1) return false;
+    }
+    return true;
+  }
+
+  /* ---------- 左栏 ---------- */
+  var filters = document.getElementById('filters');
+
+  /* 计算某品类下每个标签的材质数 */
+  function tagCounts(group){
+    var pool = allEntries().filter(function(e){ return !group || e.group === group; });
+    var counts = {};
+    pool.forEach(function(e){
+      (e.tags||[]).forEach(function(t){ counts[t] = (counts[t]||0)+1; });
+    });
+    return counts;
+  }
+
+  function renderFilters(){
+    var h = '';
+
+    /* 品类（单选）：只列出当前有卡片的品类
+       一张卡可对应多个品类（appliesTo），任一命中即算该品类 */
+    h += '<div class="fhead"><span class="name">品类</span><span class="hint">单选</span></div><div class="chips">';
+    var hasAny = false;
+    allGroups().forEach(function(g){
+      var n = allEntries().filter(function(e){
+        return e.appliesTo ? e.appliesTo.indexOf(g) > -1 : e.group === g;
+      }).length;
+      if(!n) return;
+      hasAny = true;
+      h += '<button class="chip' + (state.group===g?' on':'') + '" data-group="' + esc(g) + '">' +
+           esc(g) + '<span class="ct">' + n + '</span></button>';
+    });
+    if(!hasAny) h += '<div class="fnote">还没有入库内容，<br>用「AI 识别入库」添加</div>';
+    h += '</div>';
+
+    /* 材质：随品类联动，显示包含关系 */
+    h += '<div class="fhead"><span class="name">材质</span><span class="hint">' +
+         (state.group ? '含下级' : '先选品类') + '</span></div>';
+    if(state.group){
+      var pool = {};
+      allEntries().forEach(function(e){
+        if(inGroup(e)) pool[e.material] = 1;
+      });
+      var ms = Object.keys(pool);
+      h += '<div class="chips"><button class="chip' + (!state.material?' on':'') + '" data-mat="">全部</button>';
+      ms.forEach(function(m){
+        var n = allEntries().filter(function(e){
+          return inGroup(e) && matMatch(e.material, m);
+        }).length;
+        h += '<button class="chip' + (state.material===m?' on':'') + '" data-mat="' + esc(m) + '">' +
+             esc(m) + '<span class="ct">' + n + '</span></button>';
+      });
+      h += '</div>';
+    } else {
+      h += '<div class="fnote" style="font-size:10.5px;color:var(--text-3);margin-top:6px">材质属于品类之下，先选品类</div>';
+    }
+
+    /* 特性标签：按品类适用的分类→维度 分组 */
+    var selN = Object.keys(state.tag).reduce(function(a,k){ return a + state.tag[k].length; }, 0);
+    h += '<div class="fhead"><span class="name">特性标签</span><span class="hint">' +
+         (selN ? '已选 ' + selN : '先选品类') + '</span></div>';
+
+    if(state.group && GROUP_TAGS[state.group]){
+      var counts = tagCounts(state.group);
+      var byCat = GROUP_TAGS[state.group];
+      var any = false;
+
+      Object.keys(byCat).forEach(function(cat){
+        var dims = byCat[cat];
+        var rows = '';
+        Object.keys(dims).forEach(function(dim){
+          var vals = dims[dim];
+          any = true;
+          var key = cat + '/' + dim;
+          var open = !!state.openDims[key];
+          // 该品类真实用到的排前面，其余作为可选参考
+          var used = vals.filter(function(v){ return counts[v] > 0; });
+          var rest = vals.filter(function(v){ return !counts[v]; });
+          used.sort(function(a,b){ return counts[b]-counts[a]; });
+          var live = used.concat(rest);
+          if(!live.length) return;
+          rows += '<div class="dim' + (open?' open':'') + '" data-dim="' + esc(key) + '">' +
+            '<button class="dim-h"><span class="arrow">▶</span>' + esc(dim) +
+            (used.length ? ' <span style="color:var(--text-3);font-weight:400">' + used.length + '</span>' : '') +
+            ((state.tag[key]||[]).length ? ' <span style="color:var(--accent)">·' +
+              (state.tag[key]||[]).length + '</span>' : '') + '</button>' +
+            '<div class="dim-body"><div class="chips">';
+          live.forEach(function(v){
+            var n = counts[v] || 0;
+            rows += '<button class="chip' + ((state.tag[key]||[]).indexOf(v)>-1?' on':'') +
+                    (n ? '' : ' dim') +
+                    '" data-dimkey="' + esc(key) + '" data-tagval="' + esc(v) + '">' +
+                    esc(v) + (n ? '<span class="ct">' + n + '</span>' : '') + '</button>';
+          });
+          rows += '</div></div></div>';
+        });
+        if(rows) h += '<div class="fcat">' + esc(cat) + '</div>' + rows;
+      });
+      if(!any) h += '<div class="fnote" style="font-size:10.5px;color:var(--text-3)">该品类下暂无标签</div>';
+    } else {
+      h += '<div class="fnote" style="font-size:10.5px;color:var(--text-3);line-height:1.6">' +
+           '选择品类后，这里按「基础属性 / 使用场景 / 功能卖点 / 痛点与冲突 / 人群画像」等分类展示该品类可用的标签</div>';
+    }
+
+    /* 来源 */
+    if((state.userNotes||[]).length){
+      h += '<div class="fhead"><span class="name">来源</span></div><div class="chips">' +
+           '<button class="chip' + (state.source==='all'?' on':'') + '" data-src="all">全部</button>' +
+           '<button class="chip' + (state.source==='user'?' on':'') + '" data-src="user">我添加的 ' +
+           state.userNotes.length + '</button></div>';
+    }
+    filters.innerHTML = h;
+    bindFilters();
+  }
+
+  function bindFilters(){
+    filters.querySelectorAll('[data-group]').forEach(function(b){
+      b.onclick = function(){
+        state.group = state.group === b.dataset.group ? null : b.dataset.group;
+        state.material = null;
+        render();
+      };
+    });
+    filters.querySelectorAll('[data-mat]').forEach(function(b){
+      b.onclick = function(){
+        var m = b.dataset.mat;
+        state.material = (!m || state.material === m) ? null : m;
+        render();
+      };
+    });
+    filters.querySelectorAll('.dim-h').forEach(function(b){
+      b.onclick = function(){
+        var key = b.parentNode.dataset.dim;
+        state.openDims[key] = !state.openDims[key];
+        b.parentNode.classList.toggle('open', state.openDims[key]);
+      };
+    });
+    filters.querySelectorAll('[data-tagval]').forEach(function(b){
+      b.onclick = function(){
+        var key = b.dataset.dimkey, val = b.dataset.tagval;
+        if(!state.tag[key]) state.tag[key] = [];
+        var arr = state.tag[key], i = arr.indexOf(val);
+        if(i > -1) arr.splice(i,1); else arr.push(val);
+        if(!arr.length) delete state.tag[key];
+        render();
+      };
+    });
+    filters.querySelectorAll('[data-src]').forEach(function(b){
+      b.onclick = function(){ state.source = b.dataset.src; render(); };
+    });
+  }
+
+  /* ---------- 卡片 ---------- */
+  var grid = document.getElementById('grid');
+
+  function renderCards(list){
+    grid.innerHTML = list.map(function(e){
+      var editing = !!state.editing[e.id];
+      var d = editing ? state.draft[e.id] : null;
+
+      /* 编辑态读草稿，浏览态读原数据 */
+      var L = (editing ? d.lines : e.lines) || {};
+      var kws = (editing ? d.keywords : e.keywords) || [];
+      var tags = (editing ? d.tags : e.tags) || [];
+
+      function line(label, text, kws2, field){
+        if(!text) return '';
+        if(editing){
+          return '<dt>' + label + '</dt><dd>' +
+            '<div class="ed" contenteditable="true" data-f="' + field + '">' + esc(text) + '</div></dd>';
+        }
+        var words = (kws2 || []).filter(Boolean).slice().sort(function(a,b){ return b.length-a.length; });
+        var html = '', cursor = 0;
+        if(words.length){
+          var re = new RegExp(words.map(function(k){ return k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }).join('|'), 'g');
+          String(text).replace(re, function(w, offset){
+            var on = Object.keys(state.tag).some(function(x){ return (state.tag[x]||[]).indexOf(w) > -1; });
+            html += esc(String(text).slice(cursor, offset)) + '<span class="kwx' + (on ? ' on' : '') + '" data-kwt="' + esc(w) + '">' + esc(w) + '</span>';
+            cursor = offset + w.length;
+            return w;
+          });
+        }
+        html += esc(String(text).slice(cursor));
+        return '<dt>' + label + '</dt><dd>' + html + '</dd>';
+      }
+
+      /* 标签行：编辑态可删可加 */
+      var tagHtml = '';
+      if(tags.length || editing){
+        tagHtml = '<div class="ctags">' + tags.map(function(t){
+          var on = Object.keys(state.tag).some(function(k){
+            return (state.tag[k]||[]).indexOf(t) > -1;
+          });
+          return '<span class="tg' + (on?' on':'') + '" data-tg="' + esc(t) + '">' +
+                 esc(t) + (editing ? '<i class="tg-x">×</i>' : '') + '</span>';
+        }).join('') +
+        (editing ? '<button class="tg-add" data-addtag="1">+ 标签</button>' : '') +
+        '</div>';
+      }
+
+      /* 文案包装 */
+      var copyHtml = '';
+      var copies = (editing ? d.copy : e.copy) || [];
+      if(copies.length){
+        copyHtml = '<div class="chead2">文案包装 · ' + copies.length + ' 条</div>';
+        copies.forEach(function(c, i){
+          copyHtml += '<div class="copyitem"><span class="ctype">' + esc(c.type) + '</span>' +
+            (editing
+              ? '<div class="ed" contenteditable="true" data-f="copy.' + i + '">' + esc(c.text) + '</div>'
+              : esc(c.text)) +
+            '<button class="copy" data-cid="' + esc(e.id) + '" data-ci="' + i + '">复制</button></div>';
+        });
+      }
+
+      var checked = !!state.selected[e.id];
+      var actions = editing
+        ? '<span class="cedt"><button class="cbtn" data-cancel="' + esc(e.id) + '">取消</button>' +
+          '<button class="cbtn primary" data-done="' + esc(e.id) + '">完成</button></span>'
+        : (e.readOnly ? '<span class="cmine">离线快照</span>' : '<span class="cdoce" data-doce="' + esc(e.id) + '">编辑</span>');
+
+      return '<div class="card' + (editing ? ' editing' : '') +
+          (checked ? ' checked' : '') + '" data-cid="' + esc(e.id) + '"' + (state.saving[e.id] ? ' inert' : '') + '>' +
+        (state.picking
+          ? '<label class="cpick"><input type="checkbox" data-pickcard="' + esc(e.id) + '"' +
+            (checked ? ' checked' : '') + '></label>'
+          : '') +
+        '<div class="chead">' +
+          (editing
+            ? '<input class="cmat-in" data-f="material" value="' + esc(d.material) + '">'
+            : '<span class="cmat" data-cmat="' + esc(e.material) + '">' + esc(e.material) + '</span>') +
+          '<span class="ccat" data-cgroup="' + esc(e.group) + '">' +
+            esc(e.group) +
+            (e.appliesTo && e.appliesTo.length > 1
+              ? '<span class="cmore" title="适用：' + esc(e.appliesTo.join(' / ')) + '">+' +
+                (e.appliesTo.length - 1) + '</span>'
+              : '') +
+          '</span>' +
+          (e.isUser ? '<span class="cmine">我添加的</span>' : '') +
+          ((e.history && e.history.length)
+            ? '<span class="chist" data-hist="' + esc(e.id) + '" title="查看修改记录">' +
+              '记录 ' + e.history.length + '</span>' : '') +
+          actions +
+        '</div>' +
+        '<div class="ckw"' + (editing
+            ? ' contenteditable="true" data-f="keywords"'
+            : ' data-kwgroup="' + esc(e.group) + '"') + '>' +
+          esc(kws.join('、')) +
+        '</div>' +
+        tagHtml +
+        '<dl class="spec">' +
+          line('使用场景', L.scene, L.sceneKw, 'lines.scene') +
+          line('痛点人群', L.pain, L.painKw, 'lines.pain') +
+          line('卖点优势', L.sell, L.sellKw, 'lines.sell') +
+        '</dl>' +
+        copyHtml +
+        (e.isUser && !e.readOnly && !editing ? '<button class="cdel" data-del="' + esc(e.userRow.id) + '">删除这条</button>' : '') +
+      '</div>';
+    }).join('');
+  }
+
+  /* ---------- 批量操作栏 ---------- */
+  function renderBatchBar(list, selN, edN){
+    var bar = document.getElementById('batchbar');
+    if(!bar) return;
+    if(!state.picking && !selN && !edN){ bar.className = 'batchbar'; bar.innerHTML = ''; return; }
+
+    var h = '<div class="bbar">';
+    if(edN){
+      h += '<span class="btxt">正在编辑 <b>' + edN + '</b> 张</span>' +
+           '<button class="bbtn primary" data-bdone="1">全部完成</button>' +
+           '<button class="bbtn" data-bcancel="1">全部取消</button>';
+    } else {
+      h += '<span class="btxt">已选 <b>' + selN + '</b> 张</span>' +
+           '<button class="bbtn" data-bedit="1"' + (selN ? '' : ' disabled') + '>批量编辑</button>' +
+           '<button class="bbtn danger" data-bdel="1"' + (selN ? '' : ' disabled') + '>批量删除</button>' +
+           '<button class="bbtn" data-ball="1">全选当前 ' + list.length + ' 张</button>' +
+           '<button class="bbtn ghost" data-bexit="1">退出多选</button>';
+    }
+    h += '</div><div class="btip" id="batchTip"></div>';
+    bar.className = 'batchbar on';
+    bar.innerHTML = h;
+
+    var on = function(sel, fn){
+      bar.querySelectorAll(sel).forEach(function(b){ b.onclick = fn; });
+    };
+    on('[data-bedit]', function(){ startEdit(); });
+    on('[data-bdone]', function(){ doneEdit(); });
+    on('[data-bcancel]', function(){ cancelEdit(); });
+    on('[data-bexit]', function(){ state.picking = false; state.selected = {}; render(); });
+    on('[data-ball]', function(){
+      list.forEach(function(e){ state.selected[e.id] = true; });
+      render();
+    });
+    on('[data-bdel]', function(){ batchDelete(); });
+  }
+
+  /* 批量删除：内置卡片不可删，只删「我添加的」 */
+  function batchDelete(){
+    var ids = Object.keys(state.selected).filter(function(k){ return state.selected[k]; });
+    if(!ids.length) return;
+    var targets = ids.map(findEntry).filter(Boolean);
+    var userOnes = targets.filter(function(e){ return e.isUser && e.userRow && !e.readOnly; });
+    var builtin = targets.length - userOnes.length;
+
+    if(!userOnes.length){
+      alert('选中的卡片为只读快照，不能删除。请先连接云端。');
+      return;
+    }
+    var msg = '确定删除选中的 ' + userOnes.length + ' 条入库内容？\n此操作不可撤销。';
+    if(builtin) msg += '\n\n另有 ' + builtin + ' 张内置卡片不会被删除（内置内容不可删）。';
+    if(!confirm(msg)) return;
+
+    var i = 0, ok = 0, fail = [];
+    function step(){
+      if(i >= userOnes.length){
+        state.selected = {};
+        state.picking = false;
+        window.KB_RELOAD_USER_NOTES();
+        setBatchTip('已删除 ' + ok + ' 条' + (fail.length ? '，失败 ' + fail.length + ' 条' : ''),
+                   fail.length ? 'err' : 'ok');
+        render();
+        return;
+      }
+      var e = userOnes[i];
+      KB_INGEST.remove(Number(e.userRow.id))
+        .then(function(rm){ if(rm && rm.length) ok++; else fail.push(e.material); })
+        .catch(function(){ fail.push(e.material); })
+        .then(function(){
+          i++;
+          setBatchTip('删除中 ' + i + ' / ' + userOnes.length + '…');
+          step();
+        });
+    }
+    setBatchTip('删除中 0 / ' + userOnes.length + '…');
+    step();
+  }
+
+  /* ---------- 导出备份 ---------- */
+  /* 只导出「我添加的」入库内容，内置知识库是固定的、不需要备份 */
+  function exportRows(){
+    return (state.userNotes || []).map(function(e){
+      var raw = parseMaybe(e.userRow && e.userRow.raw_text, {}) || {};
+      var hist = Array.isArray(raw.history) ? raw.history : [];
+      var last = hist.length ? hist[hist.length - 1] : null;
+      return {
+        id: e.userRow ? e.userRow.id : '',
+        品类: e.group,
+        材质: (e.materials && e.materials.length) ? e.materials.join('、') : e.material,
+        关键词: (e.keywords || []).join('、'),
+        标签: (e.tags || []).join('、'),
+        使用场景: (e.lines && e.lines.scene) || '',
+        痛点人群: (e.lines && e.lines.pain) || '',
+        卖点优势: (e.lines && e.lines.sell) || '',
+        文案包装: ((e.copy || []).map(function(c){
+          return (c.type ? '[' + c.type + '] ' : '') + (c.text || '');
+        })).join('\n'),
+        规格尺寸: (raw.size) || '',
+        创建时间: e.created_at || '',
+        修改次数: hist.length,
+        最后修改: last ? fmtTime(last.t) : ''
+      };
+    });
+  }
+
+  function download(filename, content, mime){
+    // BOM 前缀，保证 Excel 打开中文不乱码
+    var blob = new Blob(['\ufeff' + content], { type: mime + ';charset=utf-8' });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url; a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(function(){ URL.revokeObjectURL(url); }, 1000);
+  }
+
+  function stamp(){
+    var d = new Date();
+    function p2(n){ return n < 10 ? '0'+n : ''+n; }
+    return d.getFullYear() + p2(d.getMonth()+1) + p2(d.getDate()) + '-' + p2(d.getHours()) + p2(d.getMinutes());
+  }
+
+  function doExport(kind){
+    var rows = exportRows();
+    if(!rows.length){
+      alert('还没有可导出的入库内容。\n先识别入库一些卡片，再来导出备份。');
+      return;
+    }
+    if(kind === 'csv'){
+      var cols = Object.keys(rows[0]);
+      var q = function(v){
+        var s = String(v == null ? '' : v);
+        // 含逗号/引号/换行的要加引号
+        return '"' + s.replace(/"/g, '""') + '"';
+      };
+      var csv = [cols.map(q).join(',')].concat(
+        rows.map(function(r){
+          return cols.map(function(c){ return q(r[c]); }).join(',');
+        })
+      ).join('\r\n');
+      download('材质卡片备份-' + stamp() + '.csv', csv, 'text/csv');
+    } else {
+      var payload = {
+        exported_at: new Date().toISOString(),
+        version: 1,
+        count: rows.length,
+        rows: rows,
+        // 连修改记录一起留档
+        history: (state.userNotes || []).map(function(e){
+          var raw = parseMaybe(e.userRow && e.userRow.raw_text, {}) || {};
+          return { id: e.userRow ? e.userRow.id : '', history: raw.history || [] };
+        })
+      };
+      download('材质卡片完整备份-' + stamp() + '.json',
+        JSON.stringify(payload, null, 2), 'application/json');
+    }
+    var menu = document.getElementById('expMenu');
+    if(menu) menu.classList.remove('on');
+    // 用按钮自身的提示，批量栏此刻是隐藏的
+    var btn = document.getElementById('expBtn');
+    if(btn){
+      // 幂等：连点导出不会互相覆盖计时器
+      if(btn._expTimer) clearTimeout(btn._expTimer);
+      if(!btn._expLabel) btn._expLabel = btn.textContent;
+      btn.textContent = '已导出 ' + rows.length + ' 条';
+      btn.classList.add('on');
+      btn._expTimer = setTimeout(function(){
+        btn.textContent = btn._expLabel || '导出备份';
+        btn.classList.remove('on');
+        btn._expTimer = null;
+      }, 2200);
+    }
+  }
+
+  /* ---------- 修改记录 ---------- */
+  function fmtTime(ts){
+    if(!ts) return '';
+    var d = new Date(ts);
+    function p2(n){ return n < 10 ? '0'+n : ''+n; }
+    var now = new Date();
+    var sameDay = d.toDateString() === now.toDateString();
+    var hm = p2(d.getHours()) + ':' + p2(d.getMinutes());
+    if(sameDay) return '今天 ' + hm;
+    return (d.getMonth()+1) + '月' + d.getDate() + '日 ' + hm;
+  }
+
+  function actorName(){
+    // 没有账号体系，用「本机随机标识」区分是谁改的，同一台设备显示一致
+    var k = 'kb_actor';
+    var v = null;
+    try{ v = localStorage.getItem(k); }catch(e){}
+    if(!v){
+      var alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+      v = '';
+      for(var i=0;i<4;i++) v += alphabet[Math.floor(Math.random()*alphabet.length)];
+      try{ localStorage.setItem(k, v); }catch(e){}
+    }
+    return v;
+  }
+  window.KB_ACTOR = actorName;
+
+  function diffHtml(d){
+    if(!d || !Object.keys(d).length) return '<span class="hnone">内容无变化</span>';
+    return Object.keys(d).map(function(k){
+      var it = d[k];
+      var from = it.from ? esc(String(it.from).slice(0, 60)) : '<i>空</i>';
+      var to = it.to ? esc(String(it.to).slice(0, 60)) : '<i>空</i>';
+      return '<div class="hrow">' +
+        '<span class="hlabel">' + esc(it.label || k) + '</span>' +
+        '<span class="hfrom">' + from + '</span>' +
+        '<span class="harrow">→</span>' +
+        '<span class="hto">' + to + '</span>' +
+      '</div>';
+    }).join('');
+  }
+
+  function showHistory(id){
+    var old = document.getElementById('histMask');
+    if(old) old.remove();
+    var e = findEntry(id);
+    if(!e) return;
+    var hist = (e.history || []).slice().reverse();
+
+    var mask = document.createElement('div');
+    mask.className = 'hist-mask';
+    mask.id = 'histMask';
+    mask.innerHTML =
+      '<div class="hist-box">' +
+        '<div class="hist-head">' +
+          '<div><div class="hist-t">修改记录</div>' +
+          '<div class="hist-s">' + esc(e.material) + ' · ' + esc(e.group) + '</div></div>' +
+          '<button class="hist-x" data-hclose="1">×</button>' +
+        '</div>' +
+        '<div class="hist-list">' +
+          (hist.length ? hist.map(function(h){
+            var act = h.a === 'create' ? '创建' : '编辑';
+            var keys = h.d ? Object.keys(h.d).length : 0;
+            return '<div class="hitem">' +
+              '<div class="hmeta"><span class="hact ' + esc(h.a) + '">' + act + '</span>' +
+                '<span class="hby">' + esc(h.by || '未知设备') + '</span>' +
+                '<span class="htime">' + fmtTime(h.t) + '</span>' +
+                (keys ? '<span class="hnum">' + keys + ' 处变更</span>' : '') +
+              '</div>' +
+              '<div class="hbody">' + diffHtml(h.d) + '</div>' +
+            '</div>';
+          }).join('') : '<div class="hempty">还没有修改记录</div>') +
+        '</div>' +
+        '<div class="hist-foot">最多保留最近 50 条记录</div>' +
+      '</div>';
+    document.body.appendChild(mask);
+    mask.addEventListener('click', function(ev){
+      if(ev.target === mask || ev.target.dataset.hclose) mask.remove();
+    });
+  }
+
+  /* ---------- 编辑（支持多张同时编辑） ---------- */
+  function makeDraft(e){
+    return {
+      material: e.material,
+      keywords: (e.keywords || []).slice(),
+      tags: (e.tags || []).slice(),
+      lines: JSON.parse(JSON.stringify(e.lines || {})),
+      copy: JSON.parse(JSON.stringify(e.copy || []))
+    };
+  }
+
+  /* 批量编辑：把选中的（或全部可编辑的）卡片一起进编辑态 */
+  function startEdit(id){
+    var targets = [];
+    if(id){
+      targets = [id];
+    } else {
+      var ids = Object.keys(state.selected).filter(function(k){ return state.selected[k]; });
+      if(!ids.length){ alert('请先勾选要编辑的卡片'); return; }
+      targets = ids;
+    }
+    targets.forEach(function(cid){
+      var e = findEntry(cid);
+      if(!e || e.readOnly || state.saving[cid]) return;
+      state.draft[cid] = makeDraft(e);
+      state.editing[cid] = true;
+    });
+    render();
+    if(targets.length === 1){
+      var f = grid.querySelector('.card.editing .cmat-in');
+      if(f){ f.focus(); f.select(); }
+    } else {
+      // 多张同时编辑时，提示有几张在改
+      setBatchTip('正在同时编辑 ' + targets.length + ' 张卡片，改完每张点「完成」');
+    }
+  }
+
+  function setBatchTip(txt, kind){
+    var el = document.getElementById('batchTip');
+    if(!el) return;
+    el.className = 'btip ' + (kind || 'busy');
+    el.textContent = txt;
+  }
+
+  function cancelEdit(id){
+    if(Object.keys(state.saving).length) return;
+    if(id){
+      delete state.draft[id];
+      delete state.editing[id];
+    } else {
+      Object.keys(state.draft).forEach(function(k){ delete state.draft[k]; });
+      state.editing = {};
+    }
+    render();
+  }
+
+  /* 云端确认后才关闭草稿，失败可重试。 */
+  function saveCard(id){
+    var e = findEntry(id), d = state.draft[id];
+    if(!e || !d || e.readOnly || state.saving[id]) return Promise.resolve(false);
+    var draft = JSON.parse(JSON.stringify(d));
+    var material = (draft.material || '').trim() || e.material;
+    var materials = (e.materials || [e.material]).slice();
+    materials[0] = material;
+    state.saving[id] = true;
+    var card = grid.querySelector('[data-cid="' + id + '"]');
+    if(card) card.inert = true;
+    setSyncStatus('正在保存到云端…');
+    return Promise.resolve().then(function(){
+      var tagObj = {};
+      draft.tags.forEach(function(value){
+        var key = findDimOf(value) || '未分类/未归类';
+        (tagObj[key] = tagObj[key] || []).push(value);
+      });
+      return KB_INGEST.update(e.userRow.id, {
+        category: e.group, materials: materials, appliesTo: e.appliesTo,
+        keywords: draft.keywords, tags: tagObj,
+        copy: draft.copy, lines: draft.lines,
+        sourceText: e.userRow.source_text || '', title: e.desc || '',
+        _actor: actorName()
+      });
+    }).then(function(row){
+      if(!row) throw new Error('云端未返回保存结果');
+      e.material = material;
+      e.materials = materials;
+      e.keywords = draft.keywords;
+      e.tags = draft.tags;
+      e.lines = fillKw(draft.lines, draft.tags);
+      e.copy = draft.copy;
+      e.userRow = row;
+      try{ localStorage.setItem('kb-notes-cache-v1', JSON.stringify(state.userNotes.map(function(n){ return n.userRow; }))); }catch(cacheError){}
+      e.history = (parseMaybe(row.raw_text, {}) || {}).history || [];
+      delete state.draft[id];
+      delete state.editing[id];
+      delete state.saving[id];
+      setSyncStatus('已保存到云端');
+      return true;
+    }).catch(function(err){
+      delete state.saving[id];
+      setSyncStatus('保存失败，草稿仍保留：' + ((err && err.message) || err));
+      alert('保存失败，草稿仍保留，请重试：' + ((err && err.message) || err));
+      return false;
+    });
+  }
+
+  function doneEdit(id){
+    var ids = id ? [id] : Object.keys(state.editing);
+    return Promise.all(ids.map(saveCard)).then(function(){ render(); });
+  }
+
+  function editingCount(){ return Object.keys(state.editing).length; }
+
+  /* 句子中出现的标签词（长词优先），用于渲染可点元素 */
+  function kwIn(sentence, tags){
+    if(!sentence) return [];
+    var out = [];
+    (tags || []).slice().sort(function(a,b){ return b.length - a.length; }).forEach(function(t){
+      if(t && sentence.indexOf(t) > -1 && out.indexOf(t) === -1) out.push(t);
+    });
+    return out;
+  }
+  /* 标签选择面板 */
+  function tagPicker(){
+    var cur = grid.querySelector('.card.editing');
+    if(!cur) return;
+    var id = cur.dataset.cid;
+    var d = state.draft[id];
+    if(!d) return;
+    var box = document.getElementById('tagpick');
+    if(box){ box.remove(); return; }
+    var g = findEntry(id).group;
+    var byCat = GROUP_TAGS[g] || {};
+    var html = '<div class="tagpick-head">选择标签（点一下切换）</div>';
+    Object.keys(byCat).forEach(function(cat){
+      html += '<div class="tp-cat">' + esc(cat) + '</div><div class="tp-body">';
+      Object.keys(byCat[cat]).forEach(function(dim){
+        (byCat[cat][dim] || []).forEach(function(v){
+          var on = d.tags.indexOf(v) > -1;
+          html += '<button class="tp' + (on ? ' on' : '') + '" data-pick="' + esc(v) + '">' + esc(v) + '</button>';
+        });
+      });
+      html += '</div>';
+    });
+    box = document.createElement('div');
+    box.className = 'tagpick';
+    box.id = 'tagpick';
+    box.innerHTML = html;
+    cur.appendChild(box);
+    box.querySelectorAll('[data-pick]').forEach(function(b){
+      b.onclick = function(ev){
+        ev.stopPropagation();
+        var v = b.dataset.pick;
+        var i = d.tags.indexOf(v);
+        if(i > -1) d.tags.splice(i,1); else d.tags.push(v);
+        b.classList.toggle('on');
+        var card = grid.querySelector('.card.editing .ctags');
+        if(card){
+          card.innerHTML = d.tags.map(function(t){
+            return '<span class="tg" data-tg="' + esc(t) + '">' + esc(t) + '<i class="tg-x">×</i></span>';
+          }).join('') + '<button class="tg-add" data-addtag="1">+ 标签</button>';
+        }
+      };
+    });
+  }
+
+  /* ---------- 渲染 ---------- */
+  function render(){
+    renderFilters();
+    var list = allEntries().filter(matches);
+    var nTag = Object.keys(state.tag).reduce(function(a,k){ return a + state.tag[k].length; }, 0);
+    var selN = Object.keys(state.selected).filter(function(k){ return state.selected[k]; }).length;
+    var edN = editingCount();
+
+    document.getElementById('count').innerHTML =
+      '命中 <b>' + list.length + '</b> 条材质' +
+      (state.group ? '<span class="sep">|</span>' + esc(state.group) : '') +
+      (state.material ? '<span class="sep">|</span>' + esc(state.material) : '') +
+      (nTag ? '<span class="sep">|</span>标签 ' + nTag + ' 个' : '') +
+      (state.q.trim() ? '<span class="sep">|</span>“' + esc(state.q.trim()) + '”' : '');
+
+    renderBatchBar(list, selN, edN);
+    renderCards(list);
+
+    // 全库为空时，给出入库引导
+    var totalAll = allEntries().length;
+    if(!totalAll){
+      document.getElementById('empty').innerHTML =
+        '<div class="empty lead">' +
+          '<div class="e-title">还没有任何材质卡片</div>' +
+          '<div class="q">用「AI 识别入库」把文案、图片或文档丢进来，<br>识别出材质与标签后自动入库</div>' +
+          '<div class="e-acts">' +
+            '<button class="btn" id="eBtnDoc">上传文档批量入库</button>' +
+            '<button class="btn" id="eBtnText">粘贴文案入库</button>' +
+          '</div>' +
+        '</div>';
+      var b1 = document.getElementById('eBtnDoc');
+      var b2 = document.getElementById('eBtnText');
+      if(b1) b1.onclick = function(){ document.getElementById('aiTrigger').click(); };
+      if(b2) b2.onclick = function(){ document.getElementById('aiTrigger').click(); };
+    } else {
+      document.getElementById('empty').innerHTML = list.length ? '' :
+        '<div class="empty">' +
+        (state.q.trim()
+          ? '没有匹配「' + esc(state.q.trim()) + '」的内容<br><span class="q">换个关键词试试</span>'
+          : (state.material
+              ? '「' + esc(state.material) + '」下没有带这些标签的材质<br><span class="q">换个材质，或减少标签</span>'
+              : '没有同时满足这些条件的材质<br><span class="q">试着减少一个标签条件</span>')) +
+        '</div>';
+    }
+
+    renderStats();
+  }
+
+  function renderStats(){
+    var es = allEntries(), mats = {}, tags = {}, groups = {};
+    es.forEach(function(e){
+      groups[e.group] = 1;
+      matsOf(e).forEach(function(m){ mats[m] = 1; });
+      (e.tags||[]).forEach(function(t){ tags[t] = 1; });
+    });
+    var TREE = (window.KB_TAGS && window.KB_TAGS.tree) || {};
+    var nDim = 0, nVal = 0;
+    Object.keys(TREE).forEach(function(cat){
+      nDim += Object.keys(TREE[cat]).length;
+      Object.keys(TREE[cat]).forEach(function(d){ nVal += TREE[cat][d].values.length; });
+    });
+    document.getElementById('stats').innerHTML =
+      '<div class="stat"><div class="n">' + es.length + '</div><div class="l">材质卡片</div></div>' +
+      '<div class="stat"><div class="n">' + Object.keys(groups).length + '</div><div class="l">已覆盖品类</div></div>' +
+      '<div class="stat"><div class="n">' + Object.keys(mats).length + '</div><div class="l">已识别材质</div></div>' +
+      '<div class="stat"><div class="n">' + Object.keys(tags).length + '</div><div class="l">已用标签</div></div>' +
+      '<div class="stat"><div class="n">' + nDim + '</div><div class="l">可用标签维度</div></div>' +
+      '<div class="stat"><div class="n">' + nVal + '</div><div class="l">标签值总数</div></div>';
+  }
+
+  /* ---------- 交互 ---------- */
+  document.getElementById('q').oninput = function(e){ state.q = e.target.value; render(); };
+
+  /* 多选模式开关 */
+  /* 导出菜单 */
+  var expBtn = document.getElementById('expBtn');
+  var expMenu = document.getElementById('expMenu');
+  if(expBtn && expMenu){
+    expBtn.onclick = function(ev){
+      ev.stopPropagation();
+      expMenu.classList.toggle('on');
+    };
+    expMenu.onclick = function(ev){
+      var b = ev.target.closest('[data-exp]');
+      if(!b) return;
+      doExport(b.dataset.exp);
+    };
+    document.addEventListener('click', function(){
+      expMenu.classList.remove('on');
+    });
+  }
+
+  var pickBtn = document.getElementById('pickBtn');
+  if(pickBtn) pickBtn.onclick = function(){
+    state.picking = !state.picking;
+    if(!state.picking) state.selected = {};
+    pickBtn.classList.toggle('on', state.picking);
+    pickBtn.textContent = state.picking ? '退出多选' : '批量操作';
+    render();
+  };
+  document.getElementById('reset').onclick = function(){
+    state.q=''; state.group=null; state.material=null; state.tag={}; state.source='all';
+    state.selected = {}; state.picking = false;
+    document.getElementById('q').value='';
+    // 编辑中时保留草稿，避免误点清空把编辑内容冲掉
+    var keepEdit = state.editing, keepDraft = state.draft;
+    render();
+    state.editing = keepEdit; state.draft = keepDraft;
+    render();
+  };
+
+  function findEntry(id){
+    var all = allEntries();
+    for(var i=0;i<all.length;i++) if(all[i].id === id) return all[i];
+    return null;
+  }
+  function findDimOf(val){
+    // 注意：forEach 里的 return 只跳出本次回调，必须用 for 循环才能终止外层
+    var cats = Object.keys(TREE);
+    for(var i=0;i<cats.length;i++){
+      var dims = Object.keys(TREE[cats[i]]);
+      for(var j=0;j<dims.length;j++){
+        if(TAG_VALUES[cats[i] + '/' + dims[j] + '/' + val]) return cats[i] + '/' + dims[j];
+      }
+    }
+    return null;
+  }
+  function toggleTag(key, val){
+    if(!state.tag[key]) state.tag[key] = [];
+    var arr = state.tag[key], i = arr.indexOf(val);
+    if(i > -1) arr.splice(i,1); else arr.push(val);
+    if(!arr.length) delete state.tag[key];
+    state.openDims[key] = true;
+  }
+
+  grid.addEventListener('click', function(ev){
+    var t = ev.target, cls = t.classList;
+
+    /* 编辑态下，品类 chip 仍可点击（切换品类方便编辑别的卡片），
+       但材质名/关键词/句子不触发筛选，避免误操作 */
+    if(editingCount() && t.closest('.card.editing') && !t.dataset.doce &&
+       !cls.contains('cbtn') && !t.dataset.cancel && !t.dataset.done &&
+       !t.dataset.addtag && !cls.contains('tg') && !cls.contains('copy')){
+      return;
+    }
+
+    /* 卡片复选框（多选模式） */
+    if(t.dataset && t.dataset.pickcard !== undefined){
+      var pid = t.dataset.pickcard;
+      if(t.checked) state.selected[pid] = true; else delete state.selected[pid];
+      var card = t.closest('.card');
+      if(card) card.classList.toggle('checked', t.checked);
+      renderBatchBar(allEntries().filter(matches),
+        Object.keys(state.selected).length, editingCount());
+      return;
+    }
+    /* 编辑态下：取消 / 完成（只影响该卡片；无 id 时为全部） */
+    if(t.dataset && t.dataset.cancel !== undefined){ cancelEdit(t.dataset.cancel || undefined); return; }
+    if(t.dataset && t.dataset.done !== undefined){ doneEdit(t.dataset.done || undefined); return; }
+    /* 打开标签选择面板 */
+    if(t.dataset && t.dataset.addtag){ tagPicker(); return; }
+    /* 编辑态：点标签 = 删掉它 */
+    if(editingCount() && cls.contains('tg') && t.dataset.tg){
+      var cid0 = (t.closest('.card') || {}).dataset ? t.closest('.card').dataset.cid : null;
+      var d = state.draft[cid0];
+      if(d){
+        var i = d.tags.indexOf(t.dataset.tg);
+        if(i > -1) d.tags.splice(i,1);
+        var box = grid.querySelector('.card.editing .ctags');
+        if(box){
+          box.innerHTML = d.tags.map(function(x){
+            return '<span class="tg" data-tg="' + esc(x) + '">' + esc(x) + '<i class="tg-x">×</i></span>';
+          }).join('') + '<button class="tg-add" data-addtag="1">+ 标签</button>';
+        }
+        var pick = document.getElementById('tagpick');
+        if(pick){
+          pick.querySelectorAll('[data-pick]').forEach(function(b){
+            if(b.dataset.pick === t.dataset.tg) b.classList.remove('on');
+          });
+        }
+      }
+      return;
+    }
+
+    /* 点材质名 → 筛该材质 */
+    if(cls.contains('cmat')){
+      var m = t.dataset.cmat;
+      /* 一张卡适用多个品类，点材质时不再强制切品类，
+         否则会把用户锁死在该卡的第一品类里，看不到它也适配别的品类 */
+      state.material = state.material === m ? null : m;
+      render();
+      return;
+    }
+    /* 点品类 → 筛该品类 */
+    if(cls.contains('ccat')){
+      var g = t.dataset.cgroup;
+      state.group = state.group === g ? null : g;
+      state.material = null;
+      render();
+      return;
+    }
+    /* 点标签 → 切换 */
+    if(cls.contains('tg') && t.dataset.tg){
+      var key = findDimOf(t.dataset.tg);
+      if(key){ toggleTag(key, t.dataset.tg); render(); }
+      return;
+    }
+    /* 点句中的重点词 → 同步切换该标签的筛选 */
+    if(cls.contains('kwx') && t.dataset.kwt){
+      var kw = t.dataset.kwt;
+      var dkey = findDimOf(kw);
+      if(dkey){
+        toggleTag(dkey, kw);
+        // 若还没选品类，先切到该卡片所在品类，保证标签在筛选面板里可见
+        if(!state.group){
+          var owner = allEntries().filter(function(x){ return (x.tags||[]).indexOf(kw) > -1; })[0];
+          if(owner) state.group = owner.group;
+        }
+        render();
+      }
+      return;
+    }
+    /* 点关键词 → 跳到该品类的标签面板 */
+    if(cls.contains('ckw')){
+      state.group = t.dataset.kwgroup || state.group;
+      render();
+      return;
+    }
+    /* 复制：编辑态从草稿取，浏览态从数据取 */
+    if(cls.contains('copy') && t.dataset.cid){
+      var src = null;
+      if(state.editing[t.dataset.cid] && state.draft[t.dataset.cid]){
+        src = (state.draft[t.dataset.cid].copy || [])[Number(t.dataset.ci || 0)];
+      } else {
+        var e2 = findEntry(t.dataset.cid);
+        src = e2 && (e2.copy || [])[Number(t.dataset.ci || 0)];
+      }
+      if(src) copyText(src.text, t);
+      return;
+    }
+    /* 点「编辑」→ 进入编辑态 */
+    if(t.dataset && t.dataset.doce !== undefined){
+      startEdit(t.dataset.doce);
+      return;
+    }
+    /* 点「记录 N」→ 打开修改记录 */
+    if(t.dataset && t.dataset.hist !== undefined){
+      showHistory(t.dataset.hist);
+      return;
+    }
+    /* 删除 */
+    if(t.dataset && t.dataset.del !== undefined){
+      if(!confirm('删除这条入库内容？此操作不可撤销。')) return;
+      KB_INGEST.remove(Number(t.dataset.del)).then(function(rm){
+        if(!rm || !rm.length){ alert('删除失败：记录不存在或不属于你。'); return; }
+        window.KB_RELOAD_USER_NOTES();
+      }).catch(function(err){ alert('删除失败：' + ((err&&err.message)||err)); });
+    }
+  });
+
+  /* ---------- 编辑态：输入同步到草稿 ---------- */
+  function applyField(cardEl, field, el){
+    var id = cardEl.dataset.cid;
+    var d = state.draft[id];
+    if(!d) return;
+    // input 用 value，其余 contenteditable 用 textContent
+    var text = (el.tagName === 'INPUT') ? el.value : el.textContent;
+
+    if(field === 'material'){ d.material = text.trim(); return; }
+    if(field === 'keywords'){
+      d.keywords = text.split(/[、,，\s]+/).map(function(x){ return x.trim(); })
+               .filter(Boolean).slice(0,5);
+      return;
+    }
+    if(field.indexOf('copy.') === 0){
+      var i = Number(field.slice(5));
+      if(d.copy[i]) d.copy[i].text = text.trim();
+      return;
+    }
+    var key = field.split('.')[1];
+    if(key){ d.lines = d.lines || {}; d.lines[key] = text.trim(); }
+  }
+
+  grid.addEventListener('input', function(ev){
+    if(!editingCount()) return;
+    var el = ev.target;
+    if(!el.dataset || !el.dataset.f) return;
+    var card = el.closest('.card');
+    if(card) applyField(card, el.dataset.f, el);
+  });
+
+  /* 取消编辑时不丢失筛选条件 */
+  document.addEventListener('keydown', function(ev){
+    if(ev.key === 'Escape' && editingCount()){ cancelEdit(); }
+  });
+
+  function copyText(text, btn){
+    var ok = function(){ btn.textContent='已复制'; setTimeout(function(){btn.textContent='复制';},1200); };
+    var fail = function(){ btn.textContent='失败'; setTimeout(function(){btn.textContent='复制';},1200); };
+    if(navigator.clipboard && window.isSecureContext){
+      navigator.clipboard.writeText(text).then(ok, function(){ legacy(text)?ok():fail(); });
+    } else { legacy(text) ? ok() : fail(); }
+  }
+  function legacy(text){
+    try{
+      var ta=document.createElement('textarea');
+      ta.value=text; ta.style.position='fixed'; ta.style.opacity='0';
+      document.body.appendChild(ta); ta.select();
+      var d=document.execCommand('copy');
+      document.body.removeChild(ta);
+      return d;
+    }catch(e){ return false; }
+  }
+
+  /* ---------- AI 面板联动 ---------- */
+  window.KB_APPLY_FILTER = function(opts){
+    opts = opts || {};
+    state.q=''; document.getElementById('q').value='';
+    state.group = opts.group || null;
+    state.material = opts.material || null;
+    state.tag = {};
+    (opts.tags || []).forEach(function(x){
+      var key, val;
+      if(typeof x === 'string'){ key = findDimOf(x); val = x; }
+      else { key = x.cat + '/' + x.dim; val = x.value; }
+      if(key && TAG_VALUES[key + '/' + val]){
+        if(!state.tag[key]) state.tag[key] = [];
+        if(state.tag[key].indexOf(val) < 0) state.tag[key].push(val);
+        state.openDims[key] = true;
+      }
+    });
+    render();
+    var main = document.querySelector('.main');
+    if(main) main.scrollIntoView({ behavior:'smooth', block:'start' });
+  };
+
+  function parseMaybe(v, fallback){
+    if(v == null) return fallback;
+    if(typeof v !== 'string') return v;
+    try{ return JSON.parse(v); }catch(e){ return fallback; }
+  }
+
+  function rowsToEntries(rows, readOnly){
+      return (rows||[]).map(function(r){
+        // raw_text 里存了完整扩展信息（多材质/关键词/标签维度/规格/标题）
+        var extra = parseMaybe(r.raw_text, null) || {};
+        // tags 是数组列，直接可用；老数据可能是 JSON 字符串
+        var tags = Array.isArray(r.tags) ? r.tags.slice() : (parseMaybe(r.tags, []) || []);
+        var kws = (extra.keywords && extra.keywords.length) ? extra.keywords.slice()
+                 : String(r.feel || '').split(/[,、，]/).map(function(s){ return s.trim(); }).filter(Boolean);
+        var mats = (extra.materials && extra.materials.length) ? extra.materials.slice()
+                 : String(r.material || '').split(/[、,，]/).map(function(s){ return s.trim(); }).filter(Boolean);
+        return {
+          id: 'user-' + r.id,
+          userRow: r,
+          group: r.category || '未分类',
+          // 一张卡可对应多个品类（raw_text.appliesTo），筛选时全部生效
+          appliesTo: (Array.isArray(extra.appliesTo) && extra.appliesTo.length)
+            ? extra.appliesTo.slice()
+            : [r.category || '未分类'],
+          material: mats[0] || r.material || '未命名',
+          materials: mats,
+          keywords: kws,
+          tags: tags,
+          // 三行句子存进 raw_text.lines，读取时还原
+          lines: fillKw(extra.lines || { scene:'', pain:'', sell:'' }, tags),
+          history: Array.isArray(extra.history) ? extra.history : [],
+          copy: (Array.isArray(r.copy_items) ? r.copy_items : (parseMaybe(r.copy_items, []) || [])).map(function(c){
+            return typeof c === 'string' ? {type:'卖点', text:c} : c;
+          }),
+          desc: extra.title || '',
+          created_at: r.created_at,
+          readOnly: !!readOnly,
+          isUser: true
+        };
+      });
+  }
+
+  function setSyncStatus(message, retry){
+    var el = document.getElementById('syncStatus');
+    el.textContent = message;
+    if(retry){
+      var button = document.createElement('button');
+      button.className = 'btn';
+      button.textContent = '重试连接';
+      button.onclick = window.KB_RELOAD_USER_NOTES;
+      el.appendChild(button);
+    }
+  }
+
+  window.KB_RELOAD_USER_NOTES = function(){
+    setSyncStatus('正在连接云端；当前可浏览本地快照。');
+    return KB_INGEST.list().then(function(rows){
+      if(editingCount()){
+        setSyncStatus('云端已连接；请先完成或取消当前编辑，再刷新数据。');
+        return state.userNotes.length;
+      }
+      state.userNotes = rowsToEntries(rows, false);
+      try{ localStorage.setItem('kb-notes-cache-v1', JSON.stringify(rows)); }catch(e){}
+      render();
+      setSyncStatus('云端已连接，卡片编辑将保存到云端。');
+      return state.userNotes.length;
+    }).catch(function(e){
+      console.warn('读取入库内容失败', e);
+      setSyncStatus('云端连接失败；当前显示只读快照，可搜索、筛选和复制。', true);
+      return 0;
+    });
+  };
+
+  var cachedRows;
+  try{ cachedRows = JSON.parse(localStorage.getItem('kb-notes-cache-v1')); }catch(e){}
+  state.userNotes = rowsToEntries(Array.isArray(cachedRows) ? cachedRows : window.KB_SNAPSHOT_ROWS, true);
+  render();
+  window.KB_RELOAD_USER_NOTES();
+})();
+</script>
+</body>
+</html>
